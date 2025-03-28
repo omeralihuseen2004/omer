@@ -1,138 +1,123 @@
+import asyncio
+from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Record
 from flask import Flask, request
-import threading
-import os
-from datetime import datetime, timedelta
+import requests
+from datetime import datetime
 
-# إعدادات التوكنات
+# التوكنات (يجب تغييرها لمتغيرات البيئة في الإنتاج)
 TWILIO_ACCOUNT_SID = 'AC82a9ac4f93dcb0a58f1efe9e0dddc0ae'
 TWILIO_AUTH_TOKEN = '9d3b9a71dbb817a03af8d2ca12db9cdc'
 TWILIO_PHONE_NUMBER = '+17074566030'
 TELEGRAM_BOT_TOKEN = '7740770829:AAHln4sG5uHfXuf-E_HsKs7fTiWRsaiOQNs'
-SERVER_URL = 'https://your-server-url.com'  # استبدل برابط خادمك
+PUBLIC_URL = 'https://demo.twilio.com/welcome/voice/'  # يجب استبداله برابطك
 
-# تهيئة العملاء
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# تهيئة Flask
 app = Flask(__name__)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# متغير لتخزين حالات المكالمات
-call_statuses = {}
+class BotRunner:
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        self._setup_handlers()
+    
+    def _setup_handlers(self):
+        self.telegram_app.add_handler(CommandHandler("start", self.start))
+        self.telegram_app.add_handler(MessageHandler(filters.TEXT, self.handle_call))
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("أرسل رقم الهاتف (+966...) ليتصل البوت ويسجل المكالمة")
 
-# دوال التليجرام
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('مرحباً! أرسل لي رقم الهاتف وسأقوم بالاتصال به وتسجيل المكالمة.')
-
-async def handle_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    phone_number = update.message.text
-    chat_id = update.message.chat_id
-
-    if not phone_number.startswith('+'):
-        await update.message.reply_text("❌ الرجاء كتابة الرقم مع رمز الدولة (مثال: +964123456789)")
-        return
-
-    try:
-        # تخزين وقت بدء المكالمة
-        call_statuses[chat_id] = {
-            'status': 'calling',
-            'start_time': datetime.now()
-        }
-
-        call = twilio_client.calls.create(
-            url=f'{SERVER_URL}/twiml?user_id={chat_id}',
-            to=phone_number,
-            from_=TWILIO_PHONE_NUMBER,
-            record=True,
-            status_callback=f'{SERVER_URL}/status_callback?user_id={chat_id}',
-            status_callback_event=['initiated', 'ringing', 'answered', 'completed']
-        )
+    async def handle_call(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        phone = update.message.text
+        if not phone.startswith('+'):
+            await update.message.reply_text("⚠️ استخدم الصيغة الدولية (+966...)")
+            return
         
-        await update.message.reply_text(f"✅ تم بدء الاتصال بالرقم {phone_number}.")
-        
-        # بدء مؤقت لمتابعة عدم الرد
-        threading.Timer(15, check_call_status, args=[chat_id]).start()
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ فشل الاتصال. الخطأ: {str(e)}")
+        try:
+            call = twilio_client.calls.create(
+                record=True,
+                recording_status_callback=f'{PUBLIC_URL}/recording_callback?chat_id={update.message.chat_id}',
+                url=f'{PUBLIC_URL}/twiml?chat_id={update.message.chat_id}',
+                to=phone,
+                from_=TWILIO_PHONE_NUMBER
+            )
+            await update.message.reply_text(f"🎙️ جاري الاتصال بـ {phone}...")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {str(e)}")
 
-def check_call_status(chat_id):
-    if chat_id in call_statuses and call_statuses[chat_id]['status'] == 'calling':
-        send_telegram_message(chat_id, "⏳ لم يتم الرد على الاتصال بعد 15 ثانية")
+    def run_bot(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self.telegram_app.run_polling())
 
-# واجهات ويب لـ Twilio
+# --- مسارات Flask ---
 @app.route('/twiml', methods=['GET'])
-def generate_twiml():
+def twiml():
+    chat_id = request.args.get('chat_id')
     response = VoiceResponse()
-    response.say("مرحباً، هذه مكالمة مسجلة. سيتم تسجيل هذه المحادثة.")
-    response.record(timeout=10, playBeep=True, action='/recording')
+    response.say("مرحبًا، هذه مكالمة مسجلة. سيبدأ التسجيل بعد الصافرة", voice='woman', language='ar-SA')
+    response.pause(length=2)
+    response.record(
+        action=f'{PUBLIC_URL}/recording_end?chat_id={chat_id}',
+        playBeep=True,
+        maxLength=300
+    )
     return str(response)
 
-@app.route('/status_callback', methods=['POST'])
-def status_callback():
-    call_status = request.form.get('CallStatus')
-    chat_id = request.args.get('user_id')
-    
-    if chat_id not in call_statuses:
-        return 'OK', 200
-    
-    if call_status == 'answered':
-        call_statuses[chat_id]['status'] = 'answered'
-        send_telegram_message(chat_id, "📞 تم الرد على الاتصال")
-    elif call_status == 'completed':
-        duration = request.form.get('CallDuration')
-        if duration == '0':
-            send_telegram_message(chat_id, "❌ تم رفض الاتصال")
-        call_statuses.pop(chat_id, None)
-    
-    return 'OK', 200
-
-@app.route('/recording', methods=['POST'])
-def handle_recording():
+@app.route('/recording_end', methods=['POST'])
+def recording_end():
+    chat_id = request.args.get('chat_id')
     recording_url = request.form.get('RecordingUrl')
-    chat_id = request.args.get('user_id')
     
-    if recording_url and chat_id:
-        send_recording_to_telegram(chat_id, recording_url + ".mp3")
-    
-    return 'OK', 200
-
-# إرسال رسائل للتليجرام
-def send_telegram_message(chat_id, text):
-    try:
+    if recording_url:
+        recording_details = {
+            'url': recording_url,
+            'duration': request.form.get('RecordingDuration'),
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
         requests.post(
             f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-            json={'chat_id': chat_id, 'text': text}
+            json={
+                'chat_id': chat_id,
+                'text': f'🎧 تم تسجيل المكالمة:\n⏳ المدة: {recording_details["duration"]} ثانية\n📅 التاريخ: {recording_details["timestamp"]}\n🔗 الرابط: {recording_url}'
+            }
         )
-    except Exception as e:
-        print(f"Failed to send message: {e}")
+    
+    response = VoiceResponse()
+    response.say("شكرًا لك، تم إنهاء المكالمة", voice='woman', language='ar-SA')
+    response.hangup()
+    return str(response)
 
-def send_recording_to_telegram(chat_id, recording_url):
-    try:
-        audio_data = requests.get(recording_url).content
-        files = {'audio': ('call_recording.mp3', audio_data, 'audio/mpeg')}
-        data = {'chat_id': chat_id}
+@app.route('/recording_callback', methods=['POST'])
+def recording_callback():
+    recording_url = request.form.get('RecordingUrl')
+    chat_id = request.args.get('chat_id')
+    
+    if recording_url and chat_id:
         requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio',
-            files=files,
-            data=data
+            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+            json={
+                'chat_id': chat_id,
+                'text': f'✅ تم اكتمال تسجيل المكالمة:\n🔗 {recording_url}'
+            }
         )
-    except Exception as e:
-        print(f"Failed to send recording: {e}")
+    return '', 200
 
-# تشغيل الخادمين
 def run_flask():
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=8080, use_reloader=False)
+
+# جعل المتغيرات متاحة للاستيراد
+flask_thread = None
+bot_runner = None
 
 if __name__ == '__main__':
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_number))
     
-    print("✅ البوت يعمل على الخادم!")
-    application.run_polling()
+    bot_runner = BotRunner()
+    bot_runner.run_bot()
